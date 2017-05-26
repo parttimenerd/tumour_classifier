@@ -5,6 +5,7 @@ Some of the help texts are copied from the scikit-learn documentation
 """
 
 import numpy as np
+
 from sklearn import preprocessing
 from sklearn.decomposition import IncrementalPCA
 from sklearn.ensemble import RandomForestClassifier
@@ -20,14 +21,17 @@ import os
 import click
 import time
 
-from preprocessing import DB, knn_impute
+from preprocessing import DB, knn_impute, MI_RNA_NAMES
 
 
 @click.group()
 @click.option("--db", default="db.json", help="The location of the json representation of the database")
 @click.pass_context
 def cli(ctx, db):
-    """This tool allows using different machine learning algorithms (from scikit-learn)
+    """
+    Tumour Classifier by Johannes Bechberger
+
+    This tool allows using different machine learning algorithms (from scikit-learn)
     on the microRNA data from The Cancer Genome Altas project."""
     ctx.obj = {}
     if os.path.exists(db):
@@ -87,8 +91,9 @@ def learn(ctx, blood: bool, only_blood: bool, min_samples: int):
     """Group of commands that work on the database"""
     ctx.obj["blood"] = blood
     ctx.obj["only_blood"] = only_blood
-    ctx.obj["samples_and_features"] = ctx.obj["db"].sample_arrs_and_features(blood_normals=blood, tumour=not only_blood,
+    X, y = ctx.obj["db"].sample_arrs_and_features(blood_normals=blood, tumour=not only_blood,
                                                                              min_samples=min_samples)
+    ctx.obj["samples_and_features"] = X, y
     ctx.obj["min_samples"] = min_samples
 
 @learn.command()
@@ -157,7 +162,11 @@ def pca(ctx, output_file: str, n_features: int):
 @click.pass_context
 def classify(ctx, file, verbose, runs, n_jobs):
     """Cross validate classifiers. The classifiers just call the corresponding scikit-learn classes."""
-    ctx.obj["cross_val"] = lambda clf: cross_val(clf, file, runs, n_jobs)
+    X, y = load_samples_and_features(file)
+    ctx.obj["sample_vector_size"] = len(X[0])
+    ctx.obj["feature_num"] = len(set(y))
+    ctx.obj["cross_val"] = lambda clf: cross_val(X, y, clf, file, runs, n_jobs)
+    ctx.obj["cross_val_single_job"] = lambda clf: cross_val(X, y, clf, file, runs, 1)
     ctx.obj["verbose"] = verbose
 
 
@@ -255,8 +264,44 @@ def random_forest(ctx, **kwargs):
     ctx.obj["cross_val"](RandomForestClassifier(verbose=ctx.obj["verbose"], **kwargs))
 
 
-def cross_val(classificator, output_file, runs, n_jobs):
-    X, y = load_samples_and_features(output_file)
+
+@classify.command()
+@click.pass_context
+def keras_mlp(ctx):
+    """
+    Multilayer Perceptron (MLP) for multi-class softmax classification.
+    Based upon an keras example (uses tensorflow internally).
+    """
+    # based upon https://keras.io/getting-started/sequential-model-guide/
+    import keras
+    from keras.models import Sequential
+    from keras.layers import Dense, Dropout, Activation
+    from keras.optimizers import SGD
+
+    # Generate dummy data
+    import numpy as np
+    def build_model():
+        model = Sequential()
+        # Dense(64) is a fully-connected layer with 64 hidden units.
+        # in the first layer, you must specify the expected input data shape:
+        # here, 20-dimensional vectors.
+        model.add(Dense(128, activation='relu', input_dim=ctx.obj["sample_vector_size"]))
+        model.add(Dropout(0.5))
+        model.add(Dense(64, activation='relu'))
+        model.add(Dropout(0.5))
+        model.add(Dense(ctx.obj["feature_num"], activation='softmax'))
+
+        sgd = SGD(lr=0.15, decay=1e-6, momentum=0.9, nesterov=False)
+        model.compile(loss='categorical_crossentropy',
+                      optimizer=sgd,
+                      metrics=['accuracy'])
+        return model
+
+    from keras.wrappers.scikit_learn import KerasClassifier
+    ctx.obj["cross_val_single_job"](KerasClassifier(build_model))
+
+
+def cross_val(X, y, classificator, output_file, runs, n_jobs):
     scores = cross_val_score(classificator, np.array(X), y, cv=runs, n_jobs=n_jobs)
     print(scores)
     print("Accuracy: {:0.2f} (+/- {:0.2f})".format(scores.mean(), scores.std() * 2))

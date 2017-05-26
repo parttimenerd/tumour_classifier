@@ -46,6 +46,7 @@ Dependencies
 - scipy
 - scikit-learn
 - click
+- keras and tensorflow (for `keras_mpl` classifier)
 
 License
 -------
