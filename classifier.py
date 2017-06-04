@@ -3,25 +3,34 @@ CLI part of the project that also wraps the calls to scikit-learn.
 
 Some of the help texts are copied from the scikit-learn documentation
 """
+from pprint import pprint
 
 import numpy as np
+from collections import defaultdict
 
 from sklearn import preprocessing
 from sklearn.decomposition import IncrementalPCA
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import cross_val_score
+from sklearn.feature_selection import RFE
+from sklearn.model_selection import cross_val_score, RandomizedSearchCV
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.neural_network import MLPClassifier
 from sklearn.svm import LinearSVC
 from sklearn.svm import SVC
+import scipy as sp
 
+import sys
 import json
 import os
 
 import click
 import time
 
-from preprocessing import DB, knn_impute, MI_RNA_NAMES
+from typing import List, Dict, Tuple, Set
+
+from tabulate import tabulate
+
+from preprocessing import DB, knn_impute, MI_RNA_NAMES, Sample
 
 
 @click.group()
@@ -86,15 +95,36 @@ def impute(ctx, new_db_file: str, k: int):
             help="Use blood normal samples instead of tumour tissue samples")
 @click.option("--min_samples", default=20, type=int,
             help="Minimum samples for tumour to be considered")
+@click.option("--discard_missing/--no_discards", default=True,
+              help="Discard miRNAs that are missing for more than 20% of the samples")
 @click.pass_context
-def learn(ctx, blood: bool, only_blood: bool, min_samples: int):
+def learn(ctx, blood: bool, only_blood: bool, min_samples: int, discard_missing: bool):
     """Group of commands that work on the database"""
     ctx.obj["blood"] = blood
     ctx.obj["only_blood"] = only_blood
     X, y = ctx.obj["db"].sample_arrs_and_features(blood_normals=blood, tumour=not only_blood,
                                                                              min_samples=min_samples)
+    if discard_missing:
+        X = _discard_missing(X)
     ctx.obj["samples_and_features"] = X, y
     ctx.obj["min_samples"] = min_samples
+
+
+def _discard_missing(X: List[List[float]], min_nz_samples: float = 0.8) -> List[List[float]]:
+    count = [0 for i in range(len(X[0]))]
+    for x in X:
+        for i in range(len(x)):
+            if x[i] is not 0:
+                count[i] += 1
+    indexes = [i for i in range(len(count)) if count[i] < 0.8 * len(X)]
+    #print("discarded {}".format(len(indexes)))
+    return _rm_indexes(X, set(indexes))
+
+def _rm_indexes(X: List[List[float]], indexes: Set[int]) -> List[List[float]]:
+    ret = []
+    for x in X:
+        ret.append([x[i] for i in range(len(x)) if i not in indexes])
+    return ret
 
 @learn.command()
 @click.pass_context
@@ -159,14 +189,39 @@ def pca(ctx, output_file: str, n_features: int):
               help="Cross validation runs")
 @click.option("--n_jobs", default=-1, type=int,
               help="The number of parallel jobs to run for neighbors search. If -1, then the number of jobs is set to the number of CPU cores.")
+@click.option("--rfe/--no_rfe", default=False,
+              help="Use recursive feature elimination")
+@click.option("--rfe_n_features", type=int, default=60,
+              help="Number of features to select")
+@click.option("--rfe_step", type = int, default=10,
+              help="Step size for feature elimination")
+@click.option("--rfe_verbose/--rfe_silent", default=False,
+              help="Should the feature elimination print details")
+@click.option("--param_opt/--no_param_opt", default=False, help="Do a parameter optimization")
+@click.option("--param_opt_iters", default=60, type=int,
+              help="Parameter optimization iterations")
 @click.pass_context
-def classify(ctx, file, verbose, runs, n_jobs):
+def classify(ctx, file, verbose, runs, n_jobs, rfe: bool, rfe_n_features: int, rfe_step, rfe_verbose: bool,
+             param_opt: bool, param_opt_iters: bool):
     """Cross validate classifiers. The classifiers just call the corresponding scikit-learn classes."""
-    X, y = load_samples_and_features(file)
+    X, y = None, None
+    use_rfe = False
+    try: # reduced file
+        X, y = load_samples_and_features(file)
+    except: # database file
+        X, y = ctx.obj["samples_and_features"]
     ctx.obj["sample_vector_size"] = len(X[0])
     ctx.obj["feature_num"] = len(set(y))
-    ctx.obj["cross_val"] = lambda clf: cross_val(X, y, clf, file, runs, n_jobs)
-    ctx.obj["cross_val_single_job"] = lambda clf: cross_val(X, y, clf, file, runs, 1)
+    args = {
+        "X": X, "y": y, "output_file": file, "runs": runs, "n_jobs": n_jobs,
+        "rfe": rfe, "rfe_n_features": rfe_n_features, "rfe_step": rfe_step,
+        "rfe_verbose": rfe_verbose, "param_opt": param_opt, "param_opt_iters": param_opt_iters,
+        "param_opt_verbose": 2 if verbose else 0
+    }
+    single_job_args = dict(args)
+    args["n_jobs"] = 1
+    ctx.obj["cross_val"] = lambda clf, dist: cross_val(**args, classificator=clf, param_opt_dist=dist)
+    ctx.obj["cross_val_single_job"] = lambda clf, dist: cross_val(**single_job_args, classificator=clf, param_opt_dist=dist)
     ctx.obj["verbose"] = verbose
 
 
@@ -180,7 +235,51 @@ def classify(ctx, file, verbose, runs, n_jobs):
 @click.pass_context
 def svc(ctx, kernel: str, probability: bool, poly_degree: int):
     """A wrapper around the support vector machine implementation of scikit-learn"""
-    ctx.obj["cross_val"](SVC(kernel=kernel, verbose=ctx.obj["verbose"], probability=probability, degree=poly_degree))
+    ctx.obj["cross_val"](SVC(kernel=kernel, verbose=ctx.obj["verbose"], probability=probability, degree=poly_degree),
+                         {'kernel': ['rbf', 'linear'], 'gamma': [1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8],
+                          'C': [1, 10, 100, 1000]}
+                         )
+
+@learn.command()
+@click.option("--cv", default=10, type=int, help="Number of cross validations")
+@click.option("--dump_filename", default="trials.dump")
+@click.option("--dump_period", type=int, default=3)
+@click.pass_context
+def param_opt(ctx, cv: int, dump_filename: str, dump_period: int):
+    """
+    Estimate the best preprocessor and classifier. Outputs its results continuously.
+    """
+    from hpsklearn import HyperoptEstimator
+    import hpsklearn
+    from hyperopt import tpe
+    import pickle
+
+    estimator = HyperoptEstimator(preprocessing=hpsklearn.components.any_preprocessing('pp'),
+                              algo=tpe.suggest)
+    X, y = ctx.obj["samples_and_features"]
+    #estimator.fit(X, y)
+    fit_iterator = estimator.fit_iter(X, y)
+    next(fit_iterator)
+    cur_loss = 1
+    while True:
+        fit_iterator.send(1)
+        try:
+            loss = estimator.trials.best_trial["result"]["loss"]
+            if loss < cur_loss:
+                print("Ran {} trials".format(len(estimator.trials)))
+                print(estimator.best_model())
+                pprint(estimator.trials.best_trial["result"])
+                cur_loss = loss
+            if loss == cur_loss or len(estimator.trials) % dump_period:
+                if dump_filename is not None:
+                    with open(dump_filename, 'wb') as dump_file:
+                        pickle.dump(estimator.trials, dump_file)
+
+            sys.stdout.write("+")
+            sys.stdout.flush()
+        except Exception as ex:
+            print(ex)
+            pass
 
 
 @classify.command()
@@ -196,10 +295,15 @@ def svc(ctx, kernel: str, probability: bool, poly_degree: int):
 @click.option("--weights", type=click.Choice(["uniform", "distance"]), default="uniform",
               help="‘uniform’ : uniform weights. All points in each neighborhood are weighted equally. ‘distance’ : weight points by the inverse of their distance. in this case, closer neighbors of a query point will have a greater influence than neighbors which are further away. ")
 @click.pass_context
-def knn(ctx, k, algo, weights, n_jobs):
+def knn(ctx, k, algo, weights):
     """k-nearest-neighbor classifier"""
     ctx.obj["cross_val"](KNeighborsClassifier(n_neighbors=k, weights=weights,
-                                              algorithm=algo, n_jobs=n_jobs))
+                                              algorithm=algo),
+                         {"weights": ["uniform", "distance"],
+                          "algorithm": ["auto", "ball_tree", "kd_tree", "brute"],
+                          "p": [2,3,4,5],
+                          "n_neighbors": [5,6,7,8,9,10]}
+                         )
 
 
 @classify.command()
@@ -236,12 +340,17 @@ def knn(ctx, k, algo, weights, n_jobs):
     Only used when solver='sgd'.
 
               """)
-@click.option("--max_iter", default=200, type=int,
+@click.option("--max_iter", default=500, type=int,
               help="Maximum number of iterations. The solver iterates until convergence (determined by ‘tol’) or this number of iterations.")
 @click.pass_context
 def mlp(ctx, **kwargs):
     """Multi-layer Perceptron classifier. Seems to be the most promising"""
-    ctx.obj["cross_val"](MLPClassifier(verbose=ctx.obj["verbose"], **kwargs))
+    ctx.obj["cross_val"](MLPClassifier(verbose=ctx.obj["verbose"], **kwargs), {
+        "activation": ["identity", "logistic", "tanh", "relu"],
+        "solver": ["lbfgs", "sgd", "adam"],
+        "alpha": [0.001, 0.005, 0.1, 0.0001, 0.0005, 0.00001],
+        "learning_rate": ["constant", "invscaling", "adaptive"]
+    })
 
 
 @classify.command()
@@ -301,10 +410,121 @@ def keras_mlp(ctx):
     ctx.obj["cross_val_single_job"](KerasClassifier(build_model))
 
 
-def cross_val(X, y, classificator, output_file, runs, n_jobs):
-    scores = cross_val_score(classificator, np.array(X), y, cv=runs, n_jobs=n_jobs)
-    print(scores)
-    print("Accuracy: {:0.2f} (+/- {:0.2f})".format(scores.mean(), scores.std() * 2))
+def cross_val(X, y, classificator, output_file, runs: int, n_jobs: int, rfe: bool, rfe_n_features: int, rfe_step: int,
+              rfe_verbose: bool, param_opt: bool, param_opt_dist: dict, param_opt_iters: int,
+              param_opt_verbose: bool):
+    if rfe:
+        selector = RFE(classificator, verbose=rfe_verbose, step=rfe_step, n_features_to_select=rfe_n_features)
+        X = selector.fit_transform(X, y)
+    if param_opt:
+        random_search = RandomizedSearchCV(classificator, param_distributions=param_opt_dist, n_iter=param_opt_iters,
+                                           verbose=param_opt_verbose, n_jobs=-1)
+        start = time.time()
+        random_search.fit(X, y)
+        print("RandomizedSearchCV took {:.2f} seconds for {:d} candidates"
+              " parameter settings.".format((time.time() - start), param_opt_iters))
+        _report(random_search.cv_results_)
+    else:
+        scores = cross_val_score(classificator, np.array(X), y, cv=runs, n_jobs=n_jobs)
+        print(scores)
+        print("Accuracy: {:0.2f} (+/- {:0.2f})".format(scores.mean(), scores.std() * 2))
+
+
+
+# Utility function to report best scores
+# from http://scikit-learn.org/stable/auto_examples/model_selection/randomized_search.html#sphx-glr-auto-examples-model-selection-randomized-search-py
+def _report(results, n_top=3):
+    for i in range(1, n_top + 1):
+        candidates = np.flatnonzero(results['rank_test_score'] == i)
+        for candidate in candidates:
+            print("Model with rank: {0}".format(i))
+            print("Mean validation score: {0:.3f} (std: {1:.3f})".format(
+                  results['mean_test_score'][candidate],
+                  results['std_test_score'][candidate]))
+            print("Parameters: {0}".format(results['params'][candidate]))
+            print("")
+
+
+@cli.group()
+def misc():
+    pass
+
+@misc.command()
+@click.option("--per_type/--all", default=False, help="Group the miRNAs by type")
+@click.option("--asc/--desc", default=True)
+@click.option("--limit", default=10, type=int, help="Only show n entries per table, -1 for all entries")
+@click.pass_context
+def mirna_variance(ctx, per_type: bool, asc: bool, limit: int):
+    from tabulate import tabulate
+    """
+    Calculate the variance of the expression levels of all miRNAs
+    and output it
+    """
+    def table(samples: List[Sample]):
+        rows = []
+        miRNA_values = _mirna_value(samples)
+        for miRNA, values in miRNA_values.items():
+            rows.append([miRNA, sp.std(values), sp.mean(values)])
+        rows = sorted(rows, key=lambda e: e[1])
+        if not asc:
+            rows = list(reversed(rows))
+        if limit is not -1:
+            rows = rows[0:limit]
+        print(tabulate(rows, headers=["miRNA", "std", "mean"]))
+
+    db = ctx.obj["db"]  # type: DB
+
+    if per_type:
+        samples_per_type = db.samples_per_type()
+        for type in sorted(samples_per_type.keys()):
+            print(type)
+            table(samples_per_type[type])
+    else:
+        table(db.samples.values())
+
+
+@misc.command()
+@click.option("--asc/--desc", default=True)
+@click.option("--limit", default=10, type=int, help="Only show n entries per table, -1 for all entries")
+@click.pass_context
+def mirna_corr(ctx, asc: bool, limit: int):
+    db = ctx.obj["db"]  # type: DB
+    types = {}
+
+    l = []  # type: List[Tuple[str, List[float], List[int]]]
+    for sample in db.samples.values():
+        if not l:
+            l = [(n, [], []) for n in sample.mi_rna_profile.mi_rna_names]
+        if sample.tissue_type not in types:
+            types[sample.tissue_type] = len(types)
+        type = types[sample.tissue_type]
+        arr = sample.mi_rna_profile.reads_per_million
+        for i in range(len(arr)):
+            l[i][1].append(arr[i])
+            l[i][2].append(type)
+    rows = []  # type: List[Tuple[str, float]]  # miRNA, correlation
+    for miRNA, vals, types in l:
+        rows.append((miRNA, sp.stats.pearsonr(vals, types)))
+    if not asc:
+        rows = sorted(rows, key=lambda e: e[1])
+    if not asc:
+        rows = list(reversed(rows))
+    if limit is not -1:
+        rows = rows[0:limit]
+    print(tabulate(rows, headers=["miRNA", "pearsonr"]))
+
+
+def _mirna_value(samples: List[Sample]) -> Dict[str, List[float]]:
+    d = []
+    names = list(samples)[0].mi_rna_profile.mi_rna_names
+    d = [[] for n in names]
+    for sample in samples:
+        reads = sample.mi_rna_profile.reads_per_million
+        for i in range(len(reads)):
+            d[i].append(reads[i])
+    ret = {names[i]:d[i] for i in range(len(d))}
+    return ret
+
 
 if __name__ == '__main__':
     cli()

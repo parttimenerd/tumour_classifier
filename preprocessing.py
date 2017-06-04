@@ -9,6 +9,8 @@ import numpy as np
 import requests
 from io import StringIO
 
+from collections import defaultdict
+
 
 class DB:
     """
@@ -17,7 +19,7 @@ class DB:
 
     def __init__(self, cases: Dict[str, 'Case'], samples: Dict[str, 'Sample']):
         self.cases = cases
-        self.samples = samples
+        self.samples = samples  # Dict[str, 'Sample']
 
     def get_sample(self, sample_id: str) -> 'Sample':
         return self.samples[sample_id]
@@ -185,6 +187,12 @@ class DB:
     def normal_sample_count(self) -> int:
         return len([sample for sample in self.samples.values() if sample.tissue_type == NORMAL_TISSUE])
 
+    def samples_per_type(self) -> Dict[str, List['Sample']]:
+        d = defaultdict(lambda: [])
+        for sample in self.samples.values():
+            d[sample.tissue_type].append(sample)
+        return d
+
 NORMAL_TISSUE = "normal"
 
 
@@ -304,7 +312,8 @@ class MiRNAProfile:
                 MI_RNA_NAMES = mi_rna_names
             else:
                 assert mi_rna_names == MI_RNA_NAMES
-        self.reads_per_million = np.array(reads_per_million)
+        self.reads_per_million = np.array(reads_per_million)  # type: np.array
+        self.mi_rna_names = MI_RNA_NAMES
 
     def serialize(self) -> tuple:
         return (self.sample_id, self.reads_per_million.tolist())

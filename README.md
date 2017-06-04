@@ -47,6 +47,7 @@ Dependencies
 - scikit-learn
 - click
 - keras and tensorflow (for `keras_mpl` classifier)
+- hyperopt and hyperopt-sklearn for the parameter optimization
 
 License
 -------
