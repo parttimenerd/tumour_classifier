@@ -8,6 +8,7 @@ from pprint import pprint
 import numpy as np
 from collections import defaultdict
 
+import pandas as pd
 from sklearn import preprocessing
 from sklearn.decomposition import IncrementalPCA
 from sklearn.ensemble import RandomForestClassifier
@@ -31,17 +32,21 @@ from typing import List, Dict, Tuple, Set
 from tabulate import tabulate
 
 from preprocessing import DB, knn_impute, MI_RNA_NAMES, Sample
+import preprocessing as pre
 
 
 @click.group()
-@click.option("--db", default="db.json", help="The location of the json representation of the database")
+@click.argument("db")
 @click.pass_context
 def cli(ctx, db):
     """
     Tumour Classifier by Johannes Bechberger
 
     This tool allows using different machine learning algorithms (from scikit-learn)
-    on the microRNA data from The Cancer Genome Altas project."""
+    on the microRNA data from The Cancer Genome Atlas project.
+
+    The first argument is the file that contains the db (or the file the db should be stored in)
+    """
     ctx.obj = {}
     if os.path.exists(db):
         ctx.obj["db"] = DB.load(db)
@@ -62,6 +67,15 @@ def update_db(ctx, case_ids):
         ctx.obj["db"].store("{}.{}".format(ctx.obj["db_file"], time.time()))
         raise
 
+@cli.command()
+@click.pass_context
+def update(ctx):
+    try:
+        ctx.obj["db"].pull_all()
+        ctx.obj["db"].store(ctx.obj["db_file"])
+    except:
+        ctx.obj["db"].store("{}.{}".format(ctx.obj["db_file"], time.time()))
+        raise
 
 @cli.command()
 @click.argument("case_dict_file", type=click.File())
@@ -77,113 +91,61 @@ def update_db_from_dict(ctx, case_dict_file):
         ctx.obj["db"].store("{}.{}".format(ctx.obj["db_file"], time.time()))
         raise
 
-
-@cli.command()
+@cli.group()
 @click.argument("new_db_file", nargs=1)
+@click.pass_context
+def transform(ctx, new_db_file: str):
+    """ Make a transformation on the database and store it in a new file """
+    ctx.obj["store"] = lambda: ctx.obj["db"].store(new_db_file)
+
+
+@transform.command()
 @click.option("--k", type=int, default=5,
               help="Number of nearest neighbors to consider")
 @click.pass_context
-def impute(ctx, new_db_file: str, k: int):
-    """Impute missing normal sample using the average of the k nearest neighbors"""
+def impute(ctx, k: int):
+    """Impute missing normal sample using the weigthed average of the k nearest neighbors"""
     knn_impute(ctx.obj["db"], k)
-    ctx.obj["db"].store(new_db_file)
+    ctx.obj["store"]()
+
+
+@transform.command()
+@click.pass_context
+def remove_blood_normals(ctx):
+    """ Remove all blood samples """
+    ctx.obj["db"].remove_blood_normals()
+    ctx.obj["store"]()
+
+
+@transform.command()
+@click.option("--min_samples_per_tumour", default=5, type=int)
+@click.pass_context
+def discard_tumours(ctx, min_tumour_samples: int):
+    ctx.obj["db"].remove_tumours(min_tumour_samples)
+    ctx.obj["store"]()
+
+
+@transform.command()
+@click.option("--min_sample_perc", type=int, default=20,
+              help="Remove miRNAs that have missing values for more than n% of samples")
+@click.pass_context
+def discard_mirnas(ctx, min_sample_perc: int):
+    """ Remove miRNAs that have missing values for more than n% of samples """
+    ctx.obj["db"].discard_mirnas(min_sample_perc)
+    ctx.obj["store"]()
+
+
+@cli.command()
+@click.option("--blood/--no-blood", default=True)
+@click.option("--only_blood/--not_only_blood", default=False)
+@click.option("--min_samples", type=int, default=1)
+@click.pass_context
+def stats(ctx, blood: bool, only_blood: bool, min_samples: int):
+    """ Show some stats about the samples in the database """
+    ctx.obj["db"].print_stats(blood, only_blood, min_samples)
+
 
 @cli.group()
-@click.option("--blood/--no_blood", default=True,
-            help="Include blood normal samples in the set of tumour tissue samples")
-@click.option("--only_blood/--not_only_blood", default=False,
-            help="Use blood normal samples instead of tumour tissue samples")
-@click.option("--min_samples", default=20, type=int,
-            help="Minimum samples for tumour to be considered")
-@click.option("--discard_missing/--no_discards", default=True,
-              help="Discard miRNAs that are missing for more than 20% of the samples")
-@click.pass_context
-def learn(ctx, blood: bool, only_blood: bool, min_samples: int, discard_missing: bool):
-    """Group of commands that work on the database"""
-    ctx.obj["blood"] = blood
-    ctx.obj["only_blood"] = only_blood
-    X, y = ctx.obj["db"].sample_arrs_and_features(blood_normals=blood, tumour=not only_blood,
-                                                                             min_samples=min_samples)
-    if discard_missing:
-        X = _discard_missing(X)
-    ctx.obj["samples_and_features"] = X, y
-    ctx.obj["min_samples"] = min_samples
-
-
-def _discard_missing(X: List[List[float]], min_nz_samples: float = 0.8) -> List[List[float]]:
-    count = [0 for i in range(len(X[0]))]
-    for x in X:
-        for i in range(len(x)):
-            if x[i] is not 0:
-                count[i] += 1
-    indexes = [i for i in range(len(count)) if count[i] < 0.8 * len(X)]
-    #print("discarded {}".format(len(indexes)))
-    return _rm_indexes(X, set(indexes))
-
-def _rm_indexes(X: List[List[float]], indexes: Set[int]) -> List[List[float]]:
-    ret = []
-    for x in X:
-        ret.append([x[i] for i in range(len(x)) if i not in indexes])
-    return ret
-
-@learn.command()
-@click.pass_context
-def stats(ctx):
-    """Show some stats about the samples in the database"""
-    samples_per_tumour = ctx.obj["db"].samples_per_tumour(ctx.obj["blood"], not ctx.obj["only_blood"])
-    used_lines = []
-    omitted_lines = []
-    for tumour in sorted(samples_per_tumour.keys()):
-        line = "    {:50s} {:10d}".format(tumour, samples_per_tumour[tumour])
-        if samples_per_tumour[tumour] >= ctx.obj["min_samples"]:
-            used_lines.append(line)
-        else:
-            omitted_lines.append(line)
-    if len(used_lines):
-        print("--- Samples per tumour (for {} tumours with enough samples)".format(len(used_lines)))
-        for line in used_lines:
-            print(line)
-    if len(omitted_lines):
-        print("--- {} Tumours which are omitted, because they have less than {} samples"
-              .format(len(omitted_lines), ctx.obj["min_samples"]))
-        for line in omitted_lines:
-            print(line)
-    print("{} normal samples".format(ctx.obj["db"].normal_sample_count()))
-    print("Overall {} cases and {} samples".format(len(ctx.obj["db"].cases), len(ctx.obj["db"].samples)))
-
-def store_samples_and_features(X: np.array, y, filename: str):
-    with open(filename, "w") as f:
-        json.dump({"X": X.tolist(), "y": y}, f)
-
-
-def load_samples_and_features(filename: str) -> tuple:
-    with open(filename, "r") as f:
-        d = json.load(f)
-        return d["X"], d["y"]
-
-
-@learn.command()
-@click.option("--output_file", default="reduced.{}.json".format(time.time()),
-              help="File to store the reduced feature list and sample in")
-@click.option("--n_features", default=60, type=int,
-              help="Number of features to select")
-@click.pass_context
-def pca(ctx, output_file: str, n_features: int):
-    """Principal component analysis that produces a file that can be used by the classifier commands"""
-    X, y = ctx.obj["samples_and_features"]
-    for i, x in enumerate(X):
-        if len(x) == 0:
-            print(i)
-    X = preprocessing.normalize(X)
-    ipca = IncrementalPCA(n_components=n_features)
-    X = ipca.fit_transform(X, y)
-    print("Number of selected features {}".format(ipca.n_components_))
-    print("Components with maximum variance {}".format(ipca.components_))
-    store_samples_and_features(X, y, output_file)
-
-
-@learn.group()
-@click.option("--file", help="Reduced data file")
 @click.option("--verbose/--not_verbose", default=False, help="Should the classification process output information?")
 @click.option("--runs", default=10, type=int,
               help="Cross validation runs")
@@ -206,10 +168,7 @@ def classify(ctx, file, verbose, runs, n_jobs, rfe: bool, rfe_n_features: int, r
     """Cross validate classifiers. The classifiers just call the corresponding scikit-learn classes."""
     X, y = None, None
     use_rfe = False
-    try: # reduced file
-        X, y = load_samples_and_features(file)
-    except: # database file
-        X, y = ctx.obj["samples_and_features"]
+    X, y = ctx.obj["db"].sample_arrs_and_features()
     ctx.obj["sample_vector_size"] = len(X[0])
     ctx.obj["feature_num"] = len(set(y))
     args = {
@@ -240,12 +199,15 @@ def svc(ctx, kernel: str, probability: bool, poly_degree: int):
                           'C': [1, 10, 100, 1000]}
                          )
 
-@learn.command()
+@cli.command()
 @click.option("--cv", default=10, type=int, help="Number of cross validations")
 @click.option("--dump_filename", default="trials.dump")
 @click.option("--dump_period", type=int, default=3)
+@click.option("--clf", type=click.Choice(["svc_linear", "svc_poly", "svc_rbf", "svc", "knn", "random_forest",
+                                                 "any_classifier"]),
+              default="any_classifier")
 @click.pass_context
-def param_opt(ctx, cv: int, dump_filename: str, dump_period: int):
+def param_opt(ctx, cv: int, dump_filename: str, dump_period: int, clf: str):
     """
     Estimate the best preprocessor and classifier. Outputs its results continuously.
     """
@@ -253,10 +215,10 @@ def param_opt(ctx, cv: int, dump_filename: str, dump_period: int):
     import hpsklearn
     from hyperopt import tpe
     import pickle
-
-    estimator = HyperoptEstimator(preprocessing=hpsklearn.components.any_preprocessing('pp'),
-                              algo=tpe.suggest)
-    X, y = ctx.obj["samples_and_features"]
+    clf = getattr(hpsklearn, clf)("clf")
+    estimator = HyperoptEstimator(#preprocessing=hpsklearn.components.any_preprocessing('pp'),
+                              algo=tpe.suggest, classifier=clf)
+    X, y = ctx.obj["db"].sample_arrs_and_features()
     #estimator.fit(X, y)
     fit_iterator = estimator.fit_iter(X, y)
     next(fit_iterator)
@@ -525,6 +487,59 @@ def _mirna_value(samples: List[Sample]) -> Dict[str, List[float]]:
     ret = {names[i]:d[i] for i in range(len(d))}
     return ret
 
+
+@misc.command()
+@click.option("--min", type=float)
+@click.option("--max", type=float)
+@click.option("--what", type=click.Choice(["c", "tol"]))
+@click.option("--steps", type=int)
+@click.option("--cv", type=int, default=3)
+@click.option("--log_scale/--normal_scale", default=True)
+@click.pass_context
+def svc_accuracy_graph(ctx, min: float, max: float, what: str, steps: int, cv: int, log_scale: bool):
+    import seaborn as sns
+    from matplotlib import pyplot as plt
+    vals = []
+    labels = []
+    X, y = ctx.obj["db"].sample_arrs_and_features()
+    space = np.linspace(min, max, num=steps)
+    if log_scale:
+        space = np.logspace(sp.math.log(min, 10), sp.math.log(max, 10), num=steps)
+    with click.progressbar(range(steps), length=steps) as step_range:
+        for i in step_range:
+            c = space[i]
+            params = {
+                "C": 22.4314541967786,
+                "cache_size": 512,
+                "class_weight": None,
+                "coef0": 0.0,
+                "decision_function_shape": None,
+                "degree": 1,
+                "gamma": 'auto',
+                "kernel": 'linear',
+                "max_iter": 514339228.0,
+                "probability": False,
+                "random_state": 1,
+                "shrinking": False,
+                "tol": 1.051060721806241e-05,
+                "verbose": False
+            }
+            params[what] = c
+            scores = cross_val_score(SVC(**params), np.array(X), y, cv=cv, n_jobs=-1)
+            vals.append(scores.mean())
+            labels.append(c)
+            step_range.label = "Accuracy = {:2.2%}".format(scores.mean())
+    print("labels = {}".format(labels))
+    print("accuracies = {}".format(vals))
+    print("tikz format = {}".format(" ".join("({}, {})".format(x, y) for x, y in zip(labels, vals))))
+    plt.plot(labels, vals)
+    plt.ylabel("Accuracy")
+    plt.xlabel(what.upper())
+    if log_scale:
+        plt.xscale("log")
+    plt.show()
+    #ax = sns.regplot(x="C", y="Accuracy", data=data, scatter_kws = {"s": 80}, robust = True, ci = None)
+    #ax.show()
 
 if __name__ == '__main__':
     cli()

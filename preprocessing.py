@@ -2,7 +2,7 @@ import csv
 import heapq
 import json
 from enum import Enum
-from typing import List, Dict, Iterator, Optional
+from typing import List, Dict, Iterator, Optional, Callable, Union
 import pickle
 
 import numpy as np
@@ -89,6 +89,25 @@ class DB:
     def check(filename: str):
         db = DB.load(filename)
 
+    def pull_all(self):
+        r = requests.get('https://api.gdc.cancer.gov/cases')
+        json = r.json()
+        if json["warnings"]:
+            print(json["warnings"])
+        data = json["data"]
+        pages = data["pagination"]["pages"]
+        for i in range(pages):
+            self._pull_page(i * 10)
+
+    def _pull_page(self, page: int):
+        r = requests.get('https://api.gdc.cancer.gov/cases', params={"from": page, "expand": ["files", "samples"]})
+        json = r.json()
+        if json["warnings"]:
+            print(json["warnings"])
+        data = json["data"]
+        for d in data["hits"]:
+            self.pull_case(d["case_id"], d)
+
     def pull_all_cases_from_dict_list(self, d: List[dict]):
         for entry in d:
             self.pull_case(entry["case_id"])
@@ -124,14 +143,16 @@ class DB:
         for case_id in case_ids:
             self.pull_case(case_id)
 
-    def pull_case(self, case_id: str):
+    def pull_case(self, case_id: str, data: dict = None):
         if case_id in self.cases:
             return
-        r = requests.get('https://api.gdc.cancer.gov/cases/' + case_id, params={"expand": ["files", "samples"]})
-        json = r.json()
-        if json["warnings"]:
-            print(json["warnings"])
-        data = json["data"]
+        print("Pull case {}".format(case_id))
+        if not data:
+            r = requests.get('https://api.gdc.cancer.gov/cases/' + case_id, params={"expand": ["files", "samples"]})
+            json = r.json()
+            if json["warnings"]:
+                print(json["warnings"])
+            data = json["data"]
         misc = data
         sample_ids = []
         has_normal_or_blood = False
@@ -150,12 +171,9 @@ class DB:
         if len(sample_ids) == 0:
             print("No miRNA expression samples for case {}".format(case_id))
         else:
-            if False:# not has_normal_or_blood:
-                print("Skip: Case {} hasn't any normal or blood based normal samples".format(case_id))
-            else:
-                self.add_case(Case(case_id, self, sample_ids, misc))
-                print("→ {} cases and {} samples ({} normal samples) in db "
-                      .format(len(self.cases), len(self.samples), self.normal_sample_count()))
+            self.add_case(Case(case_id, self, sample_ids, misc))
+            print("→ {} cases and {} samples ({} normal samples) in db "
+                  .format(len(self.cases), len(self.samples), self.normal_sample_count()))
 
     def sample_arrs_and_features(self, blood_normals: bool = True,
                                      tumour: bool = True,
@@ -193,6 +211,79 @@ class DB:
             d[sample.tissue_type].append(sample)
         return d
 
+    def remove_mirnas(self, mirnas: List[Union[str,int]]):
+        global MI_RNA_NAMES
+        mirnas = [x if type(x) is int else MI_RNA_NAMES.index(x) for x in mirnas]
+        names = []
+        for i, name in enumerate(MI_RNA_NAMES):
+            if i not in mirnas:
+                names.append(name)
+        MI_RNA_NAMES = names
+        mirnas = set(mirnas)
+        for sample in self.samples.values():
+            profile = sample.mi_rna_profile
+            profile.mi_rna_names = MI_RNA_NAMES
+            new_vals = []
+            for i, val in enumerate(profile.reads_per_million):
+                if i in mirnas:
+                    new_vals.append(val)
+            profile.reads_per_million = np.array(new_vals)
+
+    def remove_blood_normals(self):
+        for case in self.cases.values():
+            case.filter_samples(lambda sample: not sample.is_blood, remove_from_db=True)
+
+    def remove_samples(self, type: str):
+        """ Remove all samples with the given type """
+        for case in self.cases.values():
+            case.filter_samples(lambda sample: sample.tissue_type != type, remove_from_db=True)
+
+    def discard_tumours(self, min_tumour_samples: int):
+        for tumour, count in self.samples_per_tumour():
+            if count < min_tumour_samples:
+                self.remove_samples(tumour)
+
+    def samples_per_mirna(self) -> Dict[str, int]:
+        """ Count for each miRNA the samples that have a non zero value for the miRNA """
+        ret = []
+        for sample in self.samples.values():
+            if not ret:
+                ret = [0 for k in sample.mi_rna_profile.mi_rna_names]
+            for i, val in enumerate(sample.mi_rna_profile.reads_per_million):
+                if val > 0:
+                    ret[i] += 1
+        return {MI_RNA_NAMES[i]:val for i, val in enumerate(ret)}
+
+    def discard_mirnas(self, min_sample_perc: int):
+        """ Remove miRNAs that have missing values for more than n% of samples """
+        min_samples_to_discard = np.math.ceil((1 - min_sample_perc / 100) * len(self.samples))
+        discarded_mirnas = [miRNA for miRNA, count in self.samples_per_mirna().items() if count < min_samples_to_discard]
+        self.remove_mirnas(discarded_mirnas)
+
+    def print_stats(self, blood: bool, only_blood: bool, min_samples: int):
+        """ Show some stats about the samples in the database """
+        samples_per_tumour = self.samples_per_tumour(blood, not only_blood)
+        used_lines = []
+        omitted_lines = []
+        for tumour in sorted(samples_per_tumour.keys()):
+            line = "    {:50s} {:10d}".format(tumour, samples_per_tumour[tumour])
+            if samples_per_tumour[tumour] >= min_samples:
+                used_lines.append(line)
+            else:
+                omitted_lines.append(line)
+        if len(used_lines):
+            print("--- Samples per tumour (for {} tumours with enough samples)".format(len(used_lines)))
+            for line in used_lines:
+                print(line)
+        if len(omitted_lines):
+            print("--- {} Tumours which are omitted, because they have less than {} samples"
+                  .format(len(omitted_lines), ctx.obj["min_samples"]))
+            for line in omitted_lines:
+                print(line)
+        print("{} normal samples".format(self.normal_sample_count()))
+        print("Overall {} cases and {} samples".format(len(self.cases), len(self.samples)))
+        print("{} miRNAs".format(len(MI_RNA_NAMES)))
+
 NORMAL_TISSUE = "normal"
 
 
@@ -217,7 +308,8 @@ def knn_impute(db: DB, k: int = 5):
         tumour_sample = case.get_tumour_sample()
         calculated_distances = [(t.distance(tumour_sample), n) for i, (t, n) in enumerate(known_pairs)]
         k_best = heapq.nlargest(k, calculated_distances, key=lambda x: x[0])
-        avg_vec = np.average([n.mi_rna_profile.reads_per_million for dist, n in k_best])
+        dest_sum = sum(1 / (dist * 1.0) for dist, n in k_best)
+        avg_vec = np.average([n.mi_rna_profile.reads_per_million * 1 / dist / dest_sum for dist, n in k_best])
         new_sample_id = case.id + "avg_normal"
         new_sample = Sample(new_sample_id, db, case.id, NORMAL_TISSUE, False, MiRNAProfile(new_sample_id, avg_vec), misc={})
         db.add_sample(new_sample)
@@ -259,6 +351,16 @@ class Case:
                 return sample
         return None
 
+    def filter_samples(self, filter: Callable[['Sample'], bool], remove_from_db: bool):
+        rem = []
+        for sample_id in self.sample_ids:
+            if not filter(self.db.get_sample(sample_id)):
+                rem.append(sample_id)
+                if remove_from_db:
+                    self.db.samples.pop(sample_id)
+        for r in rem:
+            self.sample_ids.remove(r)
+
 
 class Sample:
     """
@@ -292,7 +394,6 @@ class Sample:
 
     def distance(self, other_sample: 'Sample') -> float:
         return self.mi_rna_profile.distance(other_sample.mi_rna_profile)
-
 
 MI_RNA_NAMES = None
 
